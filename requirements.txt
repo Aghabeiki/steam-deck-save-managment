@@ -1,0 +1,3 @@
+# Pure-Python HTTPS for the Drive backend (in-process; never shell out — decky #729).
+requests
+certifi
