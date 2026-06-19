@@ -114,23 +114,45 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
   // All actions stay inside the QAM (no full-screen modals, which would close it).
   const backup = async () => {
     setBusy(true);
-    try { const e = await doBackup(game); toast(e ? "Backed up" : "No change since last backup"); }
-    finally { setBusy(false); refresh(); }
+    try {
+      const e = await doBackup(game);
+      toast(e ? "Backed up" : "No change since last backup");
+    } catch (err) {
+      console.error("SaveManager: backup failed", err);
+      toast("Backup failed", "See the plugin log for details.");
+    } finally { setBusy(false); refresh(); }
   };
   const doRestore = async (v: VersionEntry) => {
     if (isRunning(game.appId)) { toast("Stop the game first"); return; }
-    await revert(game, v.versionId);
-    toast(`Restored “${labelOf(v)}”`, "Your previous save was snapshotted — undo anytime.");
-    refresh();
+    try {
+      await revert(game, v.versionId);
+      toast(`Restored “${labelOf(v)}”`, "Your previous save was snapshotted — undo anytime.");
+    } catch (err) {
+      console.error("SaveManager: restore failed", err);
+      toast("Restore failed", "Your save was not changed.");
+    } finally { refresh(); }
   };
   const doPin = async (v: VersionEntry) => {
-    await setPinned(game.appId, v.versionId, !v.pinned);
-    toast(v.pinned ? "Unpinned" : "Pinned");
-    refresh();
+    try {
+      await setPinned(game.appId, v.versionId, !v.pinned);
+      toast(v.pinned ? "Unpinned" : "Pinned");
+    } catch (err) { console.error("SaveManager: pin failed", err); toast("Couldn’t update pin"); }
+    finally { refresh(); }
   };
   const startRename = (v: VersionEntry) => { setConfirmDeleteId(null); setRenamingId(v.versionId); setRenameText(v.name ?? ""); };
-  const saveRename = async (v: VersionEntry) => { await setName(game.appId, v.versionId, renameText); setRenamingId(null); refresh(); };
-  const doDelete = async (v: VersionEntry) => { await removeVersion(game.appId, v.versionId); setConfirmDeleteId(null); toast("Deleted"); refresh(); };
+  const saveRename = async (v: VersionEntry) => {
+    try {
+      await setName(game.appId, v.versionId, renameText);
+    } catch (err) { console.error("SaveManager: rename failed", err); toast("Rename failed"); }
+    finally { setRenamingId(null); refresh(); } // always clear so the edit box never sticks open
+  };
+  const doDelete = async (v: VersionEntry) => {
+    try {
+      await removeVersion(game.appId, v.versionId);
+      toast("Deleted");
+    } catch (err) { console.error("SaveManager: delete failed", err); toast("Delete failed"); }
+    finally { setConfirmDeleteId(null); refresh(); }
+  };
 
   const currentDesc = !headEntry
     ? "No backups yet — tap “Back up now”."
@@ -236,7 +258,7 @@ function Content() {
   const [selected, setSel] = useState<GameInfo | null>(lastSelected);
   const setSelected = (g: GameInfo | null) => { lastSelected = g; setSel(g); };
   return selected
-    ? <GamePanel game={selected} onBack={() => setSelected(null)} />
+    ? <GamePanel key={selected.appId} game={selected} onBack={() => setSelected(null)} />
     : <GameList onPick={setSelected} />;
 }
 

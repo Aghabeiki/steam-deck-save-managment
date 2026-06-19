@@ -88,9 +88,10 @@ class Plugin:
         return entry
 
     def _maybe_mirror(self, game_info: dict):
-        eng = get_engine()
-        if eng.get_settings(game_info["appId"]).get("driveMirror") and eng.get_drive_status()["linked"]:
-            self.loop.create_task(self._do_sync_drive(game_info))
+        # Drive auto-mirroring is parked for v2: there is NO v1 UI to see or stop it, so v1 must
+        # never sync to Drive on its own. The engine/transport stay in the tree for v2; re-enable
+        # this body (driveMirror setting + linked check -> _do_sync_drive task) when Drive ships.
+        return
 
     def _drive_client_and_root(self):
         secrets = get_engine()._read_secrets()
