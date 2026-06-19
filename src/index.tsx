@@ -1,31 +1,32 @@
-import { callable, definePlugin, addEventListener, removeEventListener, toaster } from "@decky/api";
+import { callable, definePlugin, toaster } from "@decky/api";
 import {
   ButtonItem,
-  ConfirmModal,
+  Field,
   PanelSection,
   PanelSectionRow,
   Router,
-  showModal,
   SliderField,
   TextField,
   ToggleField,
   staticClasses,
 } from "@decky/ui";
-import { useEffect, useRef, useState } from "react";
-import { FaDownload } from "react-icons/fa";
+import { Fragment, useEffect, useState } from "react";
+import { FaClockRotateLeft } from "react-icons/fa6";
 
 interface GameInfo { appId: number; name: string; }
 interface VersionEntry {
-  versionId: string; createdAt: number; name: string | null; pinned: boolean; reason: string;
+  versionId: string; createdAt: number; name: string | null; pinned: boolean; reason: string; kind?: string;
 }
 interface Listing { head: { versionId: string | null }; versions: VersionEntry[]; }
 interface Settings { keepCount: number; autoBackupOnExit: boolean; driveMirror: boolean; }
-interface DriveStatus { hasClient: boolean; linked: boolean; }
+interface LiveStatus { hasHead: boolean; matchesHead: boolean; resolvable: boolean; }
+interface Diag { steamRoot: string; steamRootExists: boolean; deckyUserHome: string | null; accounts: number[]; }
 
 const setAccountId = callable<[number], null>("set_account_id");
-const findSupported = callable<[GameInfo[]], GameInfo[]>("find_supported");
+const getSupportedGames = callable<[], GameInfo[]>("get_supported_games");
 const doBackup = callable<[GameInfo], VersionEntry | null>("do_backup");
 const getVersions = callable<[number], Listing>("get_versions");
+const getLiveStatus = callable<[number], LiveStatus>("get_live_status");
 const revert = callable<[GameInfo, string], { versionId: string } | null>("revert");
 const setPinned = callable<[number, string, boolean], boolean>("set_pinned");
 const setName = callable<[number, string, string], boolean>("set_name");
@@ -34,16 +35,7 @@ const getSettings = callable<[number], Settings>("get_settings");
 const setKeepCount = callable<[number, number], Settings>("set_keep_count");
 const setAutoBackup = callable<[number, boolean], Settings>("set_auto_backup");
 const backupOnExit = callable<[GameInfo], null>("backup_on_exit");
-const setDriveMirrorSetting = callable<[number, boolean], Settings>("set_drive_mirror");
-const setDriveClient = callable<[string, string], null>("set_drive_client");
-const getDriveStatus = callable<[], DriveStatus>("get_drive_status");
-const linkDriveStart = callable<[], { user_code: string; verification_url: string }>("link_drive_start");
-const linkDrivePoll = callable<[], { status: string }>("link_drive_poll");
-const syncDrive = callable<[GameInfo], null>("sync_drive");
-
-interface RemoteVersion { versionId: string; label: string; pinned: boolean; }
-const listRemoteVersions = callable<[GameInfo], RemoteVersion[]>("list_remote_versions");
-const restoreFromDrive = callable<[GameInfo, string], null>("restore_from_drive");
+const getDiag = callable<[], Diag>("get_diag");
 
 function isRunning(appId: number): boolean {
   try {
@@ -54,260 +46,203 @@ function isRunning(appId: number): boolean {
   }
 }
 
-function installedGames(): GameInfo[] {
-  try {
-    // @ts-ignore - Steam internal
-    const folders = SteamClient.InstallFolder.GetInstallFolders();
-    const out: GameInfo[] = [];
-    // @ts-ignore
-    for (const f of folders) for (const a of f.vecApps) {
-      try {
-        // @ts-ignore
-        const ov = appStore.GetAppOverviewByGameID(a.nAppID);
-        out.push({ appId: a.nAppID, name: ov?.display_name ?? String(a.nAppID) });
-      } catch (e) {
-        console.error("SaveManager: skipping app", a?.nAppID, e);
-      }
-    }
-    return out;
-  } catch (e) {
-    console.error("SaveManager: cannot list games", e);
-    return [];
-  }
+function relTime(ms: number): string {
+  const s = Math.max(0, (Date.now() - ms) / 1000);
+  if (s < 60) return "just now";
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
 }
 
-function RenameModal({ initial, onSave, closeModal }:
-  { initial: string; onSave: (v: string) => void; closeModal?: () => void }) {
-  const [value, setValue] = useState(initial);
-  return (
-    <ConfirmModal
-      strTitle="Name this version"
-      onOK={() => { onSave(value); closeModal?.(); }}
-      onCancel={() => closeModal?.()}
-    >
-      <TextField value={value} onChange={(e) => setValue(e.target.value)} />
-    </ConfirmModal>
-  );
+function labelOf(v: VersionEntry): string {
+  return v.name ?? new Date(v.createdAt).toLocaleString();
 }
 
-function DriveSection() {
-  const [status, setStatus] = useState<DriveStatus | null>(null);
-  const [cid, setCid] = useState("");
-  const [secret, setSecret] = useState("");
-  const [code, setCode] = useState<{ user_code: string; verification_url: string } | null>(null);
-  const timerRef = useRef<any>(null);
+const toast = (title: string, body?: string) => toaster.toast({ title, body: body ?? "" });
 
-  useEffect(() => { getDriveStatus().then(setStatus).catch(console.error); }, []);
+function GameList({ onPick }: { onPick: (g: GameInfo) => void }) {
+  const [games, setGames] = useState<GameInfo[] | null>(null);
+  const [diag, setDiag] = useState<Diag | null>(null);
 
-  // FIX I3: clear poll interval on unmount to avoid setState on unmounted component
-  useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
-
-  // FIX I1: listen for backend drive events and surface them as toasts
   useEffect(() => {
-    const done = addEventListener("drive_sync_done", (_appId: number, n: number) =>
-      toaster.toast({ title: "Drive sync complete", body: `${n} version(s) mirrored` }));
-    const err = addEventListener("drive_sync_error", (_appId: number, msg: string) =>
-      toaster.toast({ title: "Drive sync failed", body: String(msg) }));
-    const relink = addEventListener("drive_needs_relink", () => {
-      toaster.toast({ title: "Google Drive", body: "Please re-link your account" });
-      getDriveStatus().then(setStatus).catch(console.error);
-    });
-    return () => {
-      removeEventListener("drive_sync_done", done);
-      removeEventListener("drive_sync_error", err);
-      removeEventListener("drive_needs_relink", relink);
-    };
+    getSupportedGames().then(setGames).catch((e) => { console.error(e); setGames([]); });
+    getDiag().then(setDiag).catch(() => { });
   }, []);
 
-  const save = async () => { await setDriveClient(cid, secret); getDriveStatus().then(setStatus); };
-  // FIX I3: store interval in ref so it can be cleared on unmount
-  const link = async () => {
-    const c = await linkDriveStart(); setCode(c);
-    timerRef.current = setInterval(async () => {
-      const r = await linkDrivePoll().catch(() => ({ status: "error" }));
-      if (r.status === "ok") { clearInterval(timerRef.current); setCode(null); getDriveStatus().then(setStatus); }
-      else if (r.status === "denied" || r.status === "expired" || r.status === "error") { clearInterval(timerRef.current); setCode(null); }
-    }, 5000);
-  };
-
   return (
-    <PanelSection title="Google Drive">
-      {!status?.hasClient && (
-        <>
-          <PanelSectionRow><TextField label="Client ID" value={cid} onChange={(e) => setCid(e.target.value)} /></PanelSectionRow>
-          <PanelSectionRow><TextField label="Client secret" value={secret} bIsPassword onChange={(e) => setSecret(e.target.value)} /></PanelSectionRow>
-          <PanelSectionRow><ButtonItem layout="below" onClick={save}>Save Google client</ButtonItem></PanelSectionRow>
-        </>
-      )}
-      {status?.hasClient && !status.linked && !code && (
-        <PanelSectionRow><ButtonItem layout="below" onClick={link}>Link Google account</ButtonItem></PanelSectionRow>
-      )}
-      {code && (
+    <PanelSection title="Games">
+      {games === null && <PanelSectionRow>Loading…</PanelSectionRow>}
+      {games?.length === 0 && (
         <PanelSectionRow>
-          Go to {code.verification_url} and enter code: <b>{code.user_code}</b>
+          No Steam-Cloud games found.
+          {diag && ` (steamRoot ${diag.steamRootExists ? "ok" : "MISSING"}, accounts ${diag.accounts.length})`}
         </PanelSectionRow>
       )}
-      {status?.linked && <PanelSectionRow>✓ Google Drive linked</PanelSectionRow>}
+      {games?.map((g) => (
+        <PanelSectionRow key={g.appId}>
+          <ButtonItem layout="below" onClick={() => onPick(g)}>{g.name}</ButtonItem>
+        </PanelSectionRow>
+      ))}
     </PanelSection>
   );
 }
 
-function Content() {
-  const [supported, setSupported] = useState<GameInfo[]>([]);
-  const [selected, setSelected] = useState<GameInfo | null>(null);
+function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
   const [listing, setListing] = useState<Listing | null>(null);
+  const [live, setLive] = useState<LiveStatus | null>(null);
   const [keepCount, setKeep] = useState<number>(20);
   const [autoBackup, setAuto] = useState<boolean>(false);
-  const [driveMirror, setDriveMirror] = useState<boolean>(false);
-  const [syncing, setSyncing] = useState<boolean>(false);
-  const [remote, setRemote] = useState<RemoteVersion[] | null>(null);
+  const [showOpts, setShowOpts] = useState<boolean>(false);
+  const [busy, setBusy] = useState<boolean>(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameText, setRenameText] = useState<string>("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  useEffect(() => { findSupported(installedGames()).then(setSupported).catch(console.error); }, []);
-
-  useEffect(() => {
-    const done = addEventListener("drive_restore_done", () => {
-      toaster.toast({ title: "Restored from Drive", body: "Version downloaded into your list" });
-      if (selected) { refresh(selected); listRemoteVersions(selected).then(setRemote).catch(console.error); }
-    });
-    const err = addEventListener("drive_restore_error", (_a: number, msg: string) =>
-      toaster.toast({ title: "Restore failed", body: String(msg) }));
-    const relink = addEventListener("drive_needs_relink", () =>
-      toaster.toast({ title: "Google Drive", body: "Please re-link your account in the Drive section" }));
-    return () => {
-      removeEventListener("drive_restore_done", done);
-      removeEventListener("drive_restore_error", err);
-      removeEventListener("drive_needs_relink", relink);
-    };
-  }, [selected]);
-
-  const refresh = (g: GameInfo) => {
-    getVersions(g.appId).then(setListing).catch(console.error);
-    getSettings(g.appId).then((s) => { setKeep(s.keepCount); setAuto(s.autoBackupOnExit); setDriveMirror(s.driveMirror); }).catch(console.error);
+  const refresh = () => {
+    getVersions(game.appId).then(setListing).catch(console.error);
+    getSettings(game.appId).then((s) => { setKeep(s.keepCount); setAuto(s.autoBackupOnExit); }).catch(console.error);
+    getLiveStatus(game.appId).then(setLive).catch(() => setLive(null));
   };
-  const open = (g: GameInfo) => { setSelected(g); refresh(g); setRemote(null); };
+  useEffect(refresh, [game.appId]);
 
-  if (!selected) {
-    return (
-      <>
-        <PanelSection title="Supported games">
-          {supported.map((g) => (
-            <PanelSectionRow key={g.appId}>
-              <ButtonItem layout="below" onClick={() => open(g)}>{g.name}</ButtonItem>
-            </PanelSectionRow>
-          ))}
-        </PanelSection>
-        <DriveSection />
-      </>
-    );
-  }
-
-  const running = isRunning(selected.appId);
+  const running = isRunning(game.appId);
   const head = listing?.head.versionId ?? null;
+  const headEntry = listing?.versions.find((v) => v.versionId === head) ?? null;
+  const versions = listing?.versions ?? [];
+
+  // All actions stay inside the QAM (no full-screen modals, which would close it).
+  const backup = async () => {
+    setBusy(true);
+    try { const e = await doBackup(game); toast(e ? "Backed up" : "No change since last backup"); }
+    finally { setBusy(false); refresh(); }
+  };
+  const doRestore = async (v: VersionEntry) => {
+    if (isRunning(game.appId)) { toast("Stop the game first"); return; }
+    await revert(game, v.versionId);
+    toast(`Restored “${labelOf(v)}”`, "Your previous save was snapshotted — undo anytime.");
+    refresh();
+  };
+  const doPin = async (v: VersionEntry) => {
+    await setPinned(game.appId, v.versionId, !v.pinned);
+    toast(v.pinned ? "Unpinned" : "Pinned");
+    refresh();
+  };
+  const startRename = (v: VersionEntry) => { setConfirmDeleteId(null); setRenamingId(v.versionId); setRenameText(v.name ?? ""); };
+  const saveRename = async (v: VersionEntry) => { await setName(game.appId, v.versionId, renameText); setRenamingId(null); refresh(); };
+  const doDelete = async (v: VersionEntry) => { await removeVersion(game.appId, v.versionId); setConfirmDeleteId(null); toast("Deleted"); refresh(); };
+
+  const currentDesc = !headEntry
+    ? "No backups yet — tap “Back up now”."
+    : live?.resolvable
+      ? `${labelOf(headEntry)}${live.matchesHead ? "  ·  up to date ✓" : "  ·  unsaved changes since this"}`
+      : labelOf(headEntry);
 
   return (
-    <PanelSection title={selected.name}>
+    <PanelSection title={game.name}>
       <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => { setSelected(null); setListing(null); setRemote(null); }}>
-          ← Back
+        <ButtonItem layout="below" onClick={onBack}>← All games</ButtonItem>
+      </PanelSectionRow>
+
+      <Field label="Current save" description={currentDesc} bottomSeparator="thick" />
+
+      <PanelSectionRow>
+        <ButtonItem layout="below" disabled={running || busy} onClick={backup}>
+          {running ? "Stop the game to back up" : busy ? "Backing up…" : "⬇  Back up now"}
         </ButtonItem>
       </PanelSectionRow>
 
-      <PanelSectionRow>
-        <ButtonItem layout="below" disabled={running}
-          onClick={async () => { await doBackup(selected); refresh(selected); }}>
-          {running ? "Stop the game to back up" : "Back up now"}
-        </ButtonItem>
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ToggleField label="Auto-backup on exit" checked={autoBackup}
-          onChange={(v: boolean) => { setAuto(v); setAutoBackup(selected.appId, v).catch(console.error); }} />
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <ToggleField label="Mirror to Drive" checked={driveMirror}
-          onChange={(v: boolean) => { setDriveMirror(v); setDriveMirrorSetting(selected.appId, v).catch(console.error); }} />
-      </PanelSectionRow>
-      <PanelSectionRow>
-        {/* FIX M5: disable while in-flight to prevent double-tap spam */}
-        <ButtonItem layout="below" disabled={syncing}
-          onClick={() => { setSyncing(true); syncDrive(selected).catch(console.error); setTimeout(() => setSyncing(false), 4000); }}>
-          {syncing ? "Syncing…" : "Sync to Drive now"}
-        </ButtonItem>
-      </PanelSectionRow>
-      <PanelSectionRow>
-        <ButtonItem layout="below" onClick={() => listRemoteVersions(selected).then(setRemote).catch(console.error)}>
-          Restore from Drive…
-        </ButtonItem>
-      </PanelSectionRow>
-      {remote && remote
-        .filter((rv) => !(listing?.versions ?? []).some((v) => v.versionId === rv.versionId))
-        .map((rv) => (
-          <PanelSectionRow key={rv.versionId}>
-            <ButtonItem layout="below"
-              onClick={() => restoreFromDrive(selected, rv.versionId).catch(console.error)}>
-              ⬇ {rv.pinned ? "★ " : ""}{rv.label}
-            </ButtonItem>
-          </PanelSectionRow>
-        ))}
-      {remote && remote.filter((rv) => !(listing?.versions ?? []).some((v) => v.versionId === rv.versionId)).length === 0 && (
-        <PanelSectionRow>No Drive-only versions to restore.</PanelSectionRow>
-      )}
-
-      <PanelSectionRow>
-        <SliderField label="Keep last N" value={keepCount} min={5} max={100} step={5}
-          showValue notchTicksVisible
-          onChange={(v: number) => { setKeep(v); setKeepCount(selected.appId, v).catch(console.error); }} />
-      </PanelSectionRow>
-
-      {listing?.versions.map((v) => {
-        const label = v.name ?? new Date(v.createdAt).toLocaleString();
+      {versions.length > 0 && <Field label="Versions" bottomSeparator="none" />}
+      {versions.map((v) => {
         const isHead = v.versionId === head;
+
+        if (renamingId === v.versionId) {
+          return (
+            <Fragment key={v.versionId}>
+              <PanelSectionRow>
+                <TextField label="New name" value={renameText} onChange={(e) => setRenameText(e.target.value)} />
+              </PanelSectionRow>
+              <PanelSectionRow><ButtonItem layout="below" onClick={() => saveRename(v)}>Save name</ButtonItem></PanelSectionRow>
+              <PanelSectionRow><ButtonItem layout="below" onClick={() => setRenamingId(null)}>Cancel</ButtonItem></PanelSectionRow>
+            </Fragment>
+          );
+        }
+        if (confirmDeleteId === v.versionId) {
+          return (
+            <Fragment key={v.versionId}>
+              <Field label={`Delete “${labelOf(v)}”?`} description="This can’t be undone." bottomSeparator="none" />
+              <PanelSectionRow><ButtonItem layout="below" onClick={() => doDelete(v)}>Delete permanently</ButtonItem></PanelSectionRow>
+              <PanelSectionRow><ButtonItem layout="below" onClick={() => setConfirmDeleteId(null)}>Cancel</ButtonItem></PanelSectionRow>
+            </Fragment>
+          );
+        }
+        const expanded = expandedId === v.versionId;
+        const badges = (isHead ? "● " : "") + (v.pinned ? "★ " : "");
         return (
-          <PanelSectionRow key={v.versionId}>
-            <ButtonItem layout="below" disabled={running}
-              label={`${v.pinned ? "★ " : ""}${label}${isHead ? "  ●" : ""}`}
-              onClick={() => showModal(
-                <ConfirmModal strTitle={`Restore "${label}"?`} bDestructiveWarning
-                  strDescription="Your current save is snapshotted first, so you can revert this."
-                  strOKButtonText={running ? "Game is running" : "Restore"}
-                  onOK={async () => {
-                    if (isRunning(selected.appId)) return;
-                    await revert(selected, v.versionId); refresh(selected);
-                  }} />
-              )}>
-              Restore
-            </ButtonItem>
-            <ButtonItem layout="below"
-              onClick={async () => { await setPinned(selected.appId, v.versionId, !v.pinned); refresh(selected); }}>
-              {v.pinned ? "Unpin" : "Pin"}
-            </ButtonItem>
-            <ButtonItem layout="below"
-              onClick={() => showModal(
-                <RenameModal initial={v.name ?? ""}
-                  onSave={async (name) => { await setName(selected.appId, v.versionId, name); refresh(selected); }} />
-              )}>
-              Rename
-            </ButtonItem>
-            {!isHead && (
-              <ButtonItem layout="below"
-                onClick={() => showModal(
-                  <ConfirmModal strTitle={`Delete "${label}"?`} bDestructiveWarning
-                    onOK={async () => { await removeVersion(selected.appId, v.versionId); refresh(selected); }} />
-                )}>
-                Delete
+          <Fragment key={v.versionId}>
+            <PanelSectionRow>
+              <ButtonItem layout="below" bottomSeparator={expanded ? "none" : "standard"}
+                onClick={() => setExpandedId(expanded ? null : v.versionId)}>
+                {`${badges}${labelOf(v)}   ·   ${relTime(v.createdAt)}    ${expanded ? "▾" : "▸"}`}
               </ButtonItem>
+            </PanelSectionRow>
+            {expanded && (
+              <>
+                {!isHead && (
+                  <PanelSectionRow><ButtonItem layout="below" onClick={() => doRestore(v)}>↩  Restore this save</ButtonItem></PanelSectionRow>
+                )}
+                <PanelSectionRow><ButtonItem layout="below" onClick={() => doPin(v)}>{v.pinned ? "★  Unpin" : "☆  Pin (protect)"}</ButtonItem></PanelSectionRow>
+                <PanelSectionRow><ButtonItem layout="below" onClick={() => startRename(v)}>✎  Rename…</ButtonItem></PanelSectionRow>
+                {!isHead && (
+                  <PanelSectionRow><ButtonItem layout="below" onClick={() => setConfirmDeleteId(v.versionId)}>🗑  Delete…</ButtonItem></PanelSectionRow>
+                )}
+              </>
             )}
-          </PanelSectionRow>
+          </Fragment>
         );
       })}
+
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={() => setShowOpts((s) => !s)}>
+          {`⚙  Options  ${showOpts ? "▾" : "▸"}`}
+        </ButtonItem>
+      </PanelSectionRow>
+      {showOpts && (
+        <>
+          <PanelSectionRow>
+            <ToggleField label="Auto-backup on exit"
+              description="Snapshot automatically each time you quit this game"
+              checked={autoBackup}
+              onChange={(val: boolean) => { setAuto(val); setAutoBackup(game.appId, val).catch(console.error); }} />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <SliderField label="Keep last N" value={keepCount} min={5} max={100} step={5}
+              showValue notchTicksVisible
+              description="Pinned versions don’t count and are never auto-deleted"
+              onChange={(val: number) => { setKeep(val); setKeepCount(game.appId, val).catch(console.error); }} />
+          </PanelSectionRow>
+        </>
+      )}
     </PanelSection>
   );
+}
+
+// Steam can re-mount the QAM panel on focus changes (e.g. right after an action),
+// which would reset component state and drop you back to the game list. Persist the
+// open game at module scope so a remount restores the game panel instead.
+let lastSelected: GameInfo | null = null;
+
+function Content() {
+  const [selected, setSel] = useState<GameInfo | null>(lastSelected);
+  const setSelected = (g: GameInfo | null) => { lastSelected = g; setSel(g); };
+  return selected
+    ? <GamePanel game={selected} onBack={() => setSelected(null)} />
+    : <GameList onPick={setSelected} />;
 }
 
 export default definePlugin(() => {
   try {
-    // @ts-ignore
+    // @ts-ignore - Steam internal
     const steam64 = BigInt(App.m_CurrentUser.strSteamID);
     setAccountId(Number(steam64 & 0xffffffffn)).catch(console.error);
   } catch (e) {
@@ -328,7 +263,7 @@ export default definePlugin(() => {
     name: "Save Manager",
     title: <div className={staticClasses.Title}>Save Manager</div>,
     content: <Content />,
-    icon: <FaDownload />,
+    icon: <FaClockRotateLeft />,
     onDismount() { hook?.unregister?.(); },
   };
 });

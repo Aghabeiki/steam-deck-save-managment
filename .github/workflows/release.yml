@@ -1,0 +1,84 @@
+name: Build plugin zip
+
+# Produces a Decky-installable SaveManager.zip.
+#   • push a tag like v0.1.1  -> builds the zip AND attaches it to a GitHub Release
+#   • run manually (Actions tab "Run workflow") -> builds the zip as a downloadable artifact
+# The release asset URL is what you paste into Decky -> Developer -> Install Plugin from URL.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # required for the release step to upload the asset
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Build frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Assemble plugin folder
+        run: |
+          set -eux
+          PLUGIN=SaveManager
+          STAGE="build/$PLUGIN"
+          rm -rf build
+          mkdir -p "$STAGE/dist" "$STAGE/py_modules"
+          cp main.py plugin.json package.json LICENSE "$STAGE/"
+          cp dist/index.js "$STAGE/dist/"
+          cp -r defaults/py_modules/savemanager "$STAGE/py_modules/"
+          # Vendor the Python deps INTO the zip — Decky's "install from zip/url" does not run pip.
+          python -m pip install --quiet --target "$STAGE/py_modules" -r requirements.txt
+          # Drop version-specific compiled artifacts (force pure-Python so it loads under Decky's
+          # interpreter) and pip console-script/metadata noise.
+          find "$STAGE/py_modules" -name '*.so' -delete
+          rm -rf "$STAGE/py_modules/bin"
+          find "$STAGE" -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+      - name: Verify the bundle imports
+        run: PYTHONPATH="build/SaveManager/py_modules" python -c "import savemanager.api, requests, certifi; print('bundle OK')"
+
+      - name: Create zip
+        run: |
+          set -eux
+          cd build
+          zip -r -q "../SaveManager.zip" SaveManager
+          cd ..
+          unzip -l SaveManager.zip
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SaveManager-plugin-zip
+          path: SaveManager.zip
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SaveManager.zip
+          fail_on_unmatched_files: true

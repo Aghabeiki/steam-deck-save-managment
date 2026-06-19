@@ -26,7 +26,12 @@ def get_engine() -> Engine:
     global _engine
     if _engine is None:
         data_root = os.environ["DECKY_PLUGIN_RUNTIME_DIR"]
-        steam_root = os.path.join(os.path.expanduser("~"), ".local", "share", "Steam")
+        # Decky's service runs as root; DECKY_USER_HOME points at the real user's
+        # home (e.g. /home/deck) where Steam lives. Fall back to ~ for tests/non-Decky.
+        user_home = os.environ.get("DECKY_USER_HOME") or os.path.expanduser("~")
+        steam_root = os.path.join(user_home, ".local", "share", "Steam")
+        decky.logger.info(f"SaveManager: DECKY_USER_HOME={os.environ.get('DECKY_USER_HOME')} "
+                          f"steam_root={steam_root} exists={os.path.isdir(steam_root)}")
         _engine = Engine(data_root, steam_root)
     return _engine
 
@@ -51,7 +56,30 @@ class Plugin:
         return None
 
     async def find_supported(self, game_infos: list) -> list:
-        return get_engine().find_supported(game_infos)
+        eng = get_engine()
+        out = eng.find_supported(game_infos)
+        decky.logger.info(f"SaveManager.find_supported: received={len(game_infos)} "
+                          f"accounts={eng.account_ids or 'auto'} supported={len(out)}")
+        return out
+
+    async def get_supported_games(self) -> list:
+        eng = get_engine()
+        out = eng.list_supported_games()
+        decky.logger.info(f"SaveManager.get_supported_games: found={len(out)} steam_root={eng.steam_root}")
+        return out
+
+    async def get_live_status(self, app_id: int) -> dict:
+        return get_engine().live_status(app_id)
+
+    async def get_diag(self) -> dict:
+        eng = get_engine()
+        from savemanager.discovery import get_account_ids
+        return {
+            "steamRoot": eng.steam_root,
+            "steamRootExists": os.path.isdir(eng.steam_root),
+            "deckyUserHome": os.environ.get("DECKY_USER_HOME"),
+            "accounts": get_account_ids(eng.steam_root),
+        }
 
     async def do_backup(self, game_info: dict) -> Optional[dict]:
         entry = get_engine().do_backup(game_info, _now_ms(), _rand_hex())

@@ -50,6 +50,32 @@ def parse_installdir(steam_root: str, app_id: int):
     return m.group(1) if m else None
 
 
+def parse_appname(steam_root: str, app_id: int):
+    """Display name from the game's appmanifest (main library), or None."""
+    path = os.path.join(steam_root, "steamapps", f"appmanifest_{app_id}.acf")
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError:
+        return None
+    m = re.search(r'"name"\s+"(.*?)"', text)
+    return m.group(1) if m else None
+
+
+def list_cloud_app_ids(steam_root: str, account_id: int) -> list:
+    """Every app_id under userdata/<account>/ that has a remotecache.vdf (i.e. uses Steam Cloud)."""
+    ud = os.path.join(steam_root, "userdata", str(account_id))
+    try:
+        names = os.listdir(ud)
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if n.isdigit() and os.path.isfile(os.path.join(ud, n, "remotecache.vdf")):
+            out.append(int(n))
+    return sorted(out)
+
+
 def rcf_is_valid(root_dir: str, entries: list) -> bool:
     return any(os.path.isfile(os.path.join(root_dir, e.path)) for e in entries)
 

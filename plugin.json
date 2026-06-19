@@ -2,6 +2,7 @@
   "name": "SaveManager",
   "author": "amin",
   "flags": [],
+  "api_version": 1,
   "publish": {
     "tags": ["save", "backup", "cloud"],
     "description": "Per-game save version manager with Google Drive backup.",

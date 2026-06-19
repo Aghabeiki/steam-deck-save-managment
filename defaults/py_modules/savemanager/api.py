@@ -3,7 +3,7 @@ import json
 import os
 from .config import get_game_settings, set_game_setting
 from .curation import remove_version, set_name, set_pinned
-from .discovery import get_account_ids, parse_installdir, remotecache_path
+from .discovery import get_account_ids, list_cloud_app_ids, parse_appname, parse_installdir, remotecache_path
 from .mirror import download_version, list_remote_versions, read_index, sync_game
 from .versioning import cull_versions, do_backup, import_version, is_supported, kept_versions_for, list_versions, load_version_files, resume_pending_revert, revert_to
 
@@ -40,6 +40,25 @@ class Engine:
                 continue
         return out
 
+    def list_supported_games(self) -> list:
+        """Backend-side enumeration: every Steam-Cloud game (has remotecache.vdf) whose
+        saves we can actually resolve on disk. No frontend Steam APIs needed."""
+        acct = self._primary()
+        if acct is None:
+            return []
+        out = []
+        for app_id in list_cloud_app_ids(self.steam_root, acct):
+            if app_id < 10:                 # Steam client internals (e.g. 7 = sharedconfig), not games
+                continue
+            try:
+                installdir = parse_installdir(self.steam_root, app_id)
+                if is_supported(self.steam_root, acct, app_id, installdir):
+                    name = parse_appname(self.steam_root, app_id) or installdir or str(app_id)
+                    out.append({"appId": app_id, "name": name})
+            except Exception:
+                continue
+        return out
+
     def do_backup(self, game_info: dict, now_ms: int, rand_hex: str):
         acct = self._primary()
         if acct is None:
@@ -53,6 +72,24 @@ class Engine:
         if acct is not None:
             resume_pending_revert(self.data_root, self.steam_root, acct, app_id)
         return list_versions(self.data_root, app_id)
+
+    def live_status(self, app_id: int) -> dict:
+        """Does the live save match HEAD? Lets the UI show 'up to date' vs 'unsaved changes'."""
+        from .refs import read_refs
+        from .versioning import _live_matches_head
+        from .discovery import read_entries, resolve_save_roots
+        refs = read_refs(self.data_root, app_id)
+        head_id = refs["head"]["versionId"]
+        acct = self._primary()
+        if acct is None:
+            return {"hasHead": bool(head_id), "matchesHead": False, "resolvable": False}
+        installdir = parse_installdir(self.steam_root, app_id)
+        entries = read_entries(self.steam_root, acct, app_id)
+        save_roots = resolve_save_roots(self.steam_root, acct, app_id, entries, installdir)
+        if not save_roots or not head_id:
+            return {"hasHead": bool(head_id), "matchesHead": False, "resolvable": bool(save_roots)}
+        matches = _live_matches_head(self.data_root, app_id, refs, save_roots, entries)
+        return {"hasHead": True, "matchesHead": bool(matches), "resolvable": True}
 
     def revert(self, game_info: dict, target_id: str, now_ms: int, rand_hex: str):
         acct = self._primary()
