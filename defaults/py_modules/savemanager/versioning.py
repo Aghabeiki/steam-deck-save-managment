@@ -41,11 +41,14 @@ def _live_matches_head(data_root, app_id, refs, save_roots, entries) -> bool:
         if root is None:
             return False
         p = os.path.join(root, rel)
-        st = os.stat(p)
-        if st.st_size != mf["size"] or int(st.st_mtime * 1000) != mf["mtime"]:
-            return False
-        if mf.get("sha256") is not None and _hash_file(p) != mf["sha256"]:
-            return False                              # same size+mtime but different content
+        try:
+            st = os.stat(p)
+            if st.st_size != mf["size"] or int(st.st_mtime * 1000) != mf["mtime"]:
+                return False
+            if mf.get("sha256") is not None and _hash_file(p) != mf["sha256"]:
+                return False                          # same size+mtime but different content
+        except OSError:
+            return False                              # file vanished mid-check -> treat as changed
     return True
 
 

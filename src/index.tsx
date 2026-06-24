@@ -19,15 +19,17 @@ interface VersionEntry {
 }
 interface Listing { head: { versionId: string | null }; versions: VersionEntry[]; }
 interface Settings { keepCount: number; autoBackupOnExit: boolean; driveMirror: boolean; }
-interface LiveStatus { hasHead: boolean; matchesHead: boolean; resolvable: boolean; }
+interface CurrentState { matchedVersionId: string | null; matchedLabel: string | null; createdAt: number | null; isHead: boolean; modified: boolean; resolvable: boolean; }
 interface Diag { steamRoot: string; steamRootExists: boolean; deckyUserHome: string | null; accounts: number[]; }
 
 const setAccountId = callable<[number], null>("set_account_id");
 const getSupportedGames = callable<[], GameInfo[]>("get_supported_games");
 const doBackup = callable<[GameInfo], VersionEntry | null>("do_backup");
 const getVersions = callable<[number], Listing>("get_versions");
-const getLiveStatus = callable<[number], LiveStatus>("get_live_status");
+const getCurrentState = callable<[number], CurrentState>("get_current_state");
 const revert = callable<[GameInfo, string], { versionId: string } | null>("revert");
+const forceBackup = callable<[GameInfo], { status: string; entry?: VersionEntry | null }>("force_backup");
+const forceRestore = callable<[GameInfo, string], { status: string }>("force_restore");
 const setPinned = callable<[number, string, boolean], boolean>("set_pinned");
 const setName = callable<[number, string, string], boolean>("set_name");
 const removeVersion = callable<[number, string], boolean>("remove_version");
@@ -89,7 +91,7 @@ function GameList({ onPick }: { onPick: (g: GameInfo) => void }) {
 
 function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
   const [listing, setListing] = useState<Listing | null>(null);
-  const [live, setLive] = useState<LiveStatus | null>(null);
+  const [state, setState] = useState<CurrentState | null>(null);
   const [keepCount, setKeep] = useState<number>(20);
   const [autoBackup, setAuto] = useState<boolean>(false);
   const [showOpts, setShowOpts] = useState<boolean>(false);
@@ -97,12 +99,13 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState<string>("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [confirmRestoreId, setConfirmRestoreId] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const refresh = () => {
     getVersions(game.appId).then(setListing).catch(console.error);
     getSettings(game.appId).then((s) => { setKeep(s.keepCount); setAuto(s.autoBackupOnExit); }).catch(console.error);
-    getLiveStatus(game.appId).then(setLive).catch(() => setLive(null));
+    getCurrentState(game.appId).then(setState).catch(() => setState(null));
   };
   useEffect(refresh, [game.appId]);
 
@@ -115,20 +118,43 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
   const backup = async () => {
     setBusy(true);
     try {
-      const e = await doBackup(game);
-      toast(e ? "Backed up" : "No change since last backup");
+      if (running) {
+        const r = await forceBackup(game);
+        if (r.status === "ok") toast("Backed up", "Snapshot taken while playing.");
+        else if (r.status === "nochange") toast("No change since last backup");
+        else if (r.status === "writing") toast("Save is being written", "Try again in a moment.");
+        else toast("Couldn't read the save");
+      } else {
+        const e = await doBackup(game);
+        toast(e ? "Backed up" : "No change since last backup");
+      }
     } catch (err) {
       console.error("SaveManager: backup failed", err);
       toast("Backup failed", "See the plugin log for details.");
     } finally { setBusy(false); refresh(); }
   };
   const doRestore = async (v: VersionEntry) => {
-    if (isRunning(game.appId)) { toast("Stop the game first"); return; }
+    if (isRunning(game.appId)) { setConfirmRestoreId(v.versionId); return; }   // -> inline confirm
     try {
       await revert(game, v.versionId);
       toast(`Restored “${labelOf(v)}”`, "Your previous save was snapshotted — undo anytime.");
     } catch (err) {
       console.error("SaveManager: restore failed", err);
+      toast("Restore failed", "Your save was not changed.");
+    } finally { refresh(); }
+  };
+  const doForceRestore = async (v: VersionEntry) => {
+    setConfirmRestoreId(null);
+    try {
+      const r = await forceRestore(game, v.versionId);
+      if (r.status === "ok")
+        toast(`Restored “${labelOf(v)}” to disk`,
+          `Load your save in-game or restart ${game.name}; don't let it autosave first.`);
+      else if (r.status === "writing") toast("Save is being written", "Try again in a moment.");
+      else if (r.status === "unresolvable") toast("Couldn't read the save");
+      else toast("Restore failed", "That version was not found.");
+    } catch (err) {
+      console.error("SaveManager: force restore failed", err);
       toast("Restore failed", "Your save was not changed.");
     } finally { refresh(); }
   };
@@ -139,7 +165,7 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
     } catch (err) { console.error("SaveManager: pin failed", err); toast("Couldn’t update pin"); }
     finally { refresh(); }
   };
-  const startRename = (v: VersionEntry) => { setConfirmDeleteId(null); setRenamingId(v.versionId); setRenameText(v.name ?? ""); };
+  const startRename = (v: VersionEntry) => { setConfirmDeleteId(null); setConfirmRestoreId(null); setRenamingId(v.versionId); setRenameText(v.name ?? ""); };
   const saveRename = async (v: VersionEntry) => {
     try {
       await setName(game.appId, v.versionId, renameText);
@@ -148,17 +174,24 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
   };
   const doDelete = async (v: VersionEntry) => {
     try {
-      await removeVersion(game.appId, v.versionId);
-      toast("Deleted");
+      const ok = await removeVersion(game.appId, v.versionId);
+      toast(ok ? "Deleted" : "Couldn’t delete — unpin it first.");
     } catch (err) { console.error("SaveManager: delete failed", err); toast("Delete failed"); }
     finally { setConfirmDeleteId(null); refresh(); }
   };
 
+  const stateName = state?.matchedVersionId
+    ? (state.matchedLabel ?? new Date(state.createdAt ?? 0).toLocaleString())
+    : null;
   const currentDesc = !headEntry
     ? "No backups yet — tap “Back up now”."
-    : live?.resolvable
-      ? `${labelOf(headEntry)}${live.matchesHead ? "  ·  up to date ✓" : "  ·  unsaved changes since this"}`
-      : labelOf(headEntry);
+    : !state?.resolvable
+      ? labelOf(headEntry)
+      : state.modified
+        ? "✎ Modified — not backed up yet"
+        : state.isHead
+          ? `${stateName}  ·  up to date ✓`
+          : `${stateName}  ·  an earlier backup (not your latest)`;
 
   return (
     <PanelSection title={game.name}>
@@ -166,17 +199,24 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
         <ButtonItem layout="below" onClick={onBack}>← All games</ButtonItem>
       </PanelSectionRow>
 
-      <Field label="Current save" description={currentDesc} bottomSeparator="thick" />
+      <Field label="Current save" description={currentDesc} bottomSeparator="none" />
+      <PanelSectionRow>
+        <ButtonItem layout="below" onClick={refresh}>⟳  Re-check current save</ButtonItem>
+      </PanelSectionRow>
 
       <PanelSectionRow>
-        <ButtonItem layout="below" disabled={running || busy} onClick={backup}>
-          {running ? "Stop the game to back up" : busy ? "Backing up…" : "⬇  Back up now"}
+        <ButtonItem layout="below" disabled={busy} onClick={backup}>
+          {busy ? "Backing up…" : running ? "⬇  Back up now (while playing)" : "⬇  Back up now"}
         </ButtonItem>
       </PanelSectionRow>
 
       {versions.length > 0 && <Field label="Versions" bottomSeparator="none" />}
       {versions.map((v) => {
         const isHead = v.versionId === head;
+        // "Current" = the version the LIVE save actually equals by hash. After revert→play the save
+        // is modified (matches nothing) so no row is current; fall back to HEAD only if state is
+        // unreadable. Delete still keys off real HEAD below — the backend refuses to delete HEAD.
+        const isCurrent = !state || !state.resolvable ? isHead : v.versionId === state.matchedVersionId;
 
         if (renamingId === v.versionId) {
           return (
@@ -198,8 +238,19 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
             </Fragment>
           );
         }
+        if (confirmRestoreId === v.versionId) {
+          return (
+            <Fragment key={v.versionId}>
+              <Field label={`Restore “${labelOf(v)}” while playing?`}
+                description={`⚠ ${game.name} is running. This overwrites the save on disk, but the game still has the old save in memory and may overwrite this on its next autosave or when you quit.`}
+                bottomSeparator="none" />
+              <PanelSectionRow><ButtonItem layout="below" onClick={() => doForceRestore(v)}>Restore anyway</ButtonItem></PanelSectionRow>
+              <PanelSectionRow><ButtonItem layout="below" onClick={() => setConfirmRestoreId(null)}>Cancel</ButtonItem></PanelSectionRow>
+            </Fragment>
+          );
+        }
         const expanded = expandedId === v.versionId;
-        const badges = (isHead ? "● " : "") + (v.pinned ? "★ " : "");
+        const badges = (isCurrent ? "● " : "") + (v.pinned ? "★ " : "");
         return (
           <Fragment key={v.versionId}>
             <PanelSectionRow>
@@ -210,12 +261,12 @@ function GamePanel({ game, onBack }: { game: GameInfo; onBack: () => void }) {
             </PanelSectionRow>
             {expanded && (
               <>
-                {!isHead && (
+                {!isCurrent && (
                   <PanelSectionRow><ButtonItem layout="below" onClick={() => doRestore(v)}>↩  Restore this save</ButtonItem></PanelSectionRow>
                 )}
                 <PanelSectionRow><ButtonItem layout="below" onClick={() => doPin(v)}>{v.pinned ? "★  Unpin" : "☆  Pin (protect)"}</ButtonItem></PanelSectionRow>
                 <PanelSectionRow><ButtonItem layout="below" onClick={() => startRename(v)}>✎  Rename…</ButtonItem></PanelSectionRow>
-                {!isHead && (
+                {!isHead && !v.pinned && (
                   <PanelSectionRow><ButtonItem layout="below" onClick={() => setConfirmDeleteId(v.versionId)}>🗑  Delete…</ButtonItem></PanelSectionRow>
                 )}
               </>

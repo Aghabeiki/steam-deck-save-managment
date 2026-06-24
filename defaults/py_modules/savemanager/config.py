@@ -20,7 +20,10 @@ def get_game_settings(data_root, app_id) -> dict:
     """Return per-game settings merged over DEFAULTS (corruption-tolerant)."""
     try:
         with open(_game_json_path(data_root, app_id)) as f:
-            stored = json.load(f).get("settings", {})
+            data = json.load(f)
+        stored = data.get("settings", {}) if isinstance(data, dict) else {}
+        if not isinstance(stored, dict):
+            stored = {}
     except (OSError, ValueError):
         stored = {}
     return {**DEFAULTS, **stored}

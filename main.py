@@ -9,7 +9,7 @@ import requests
 
 import decky  # provided by Decky at runtime
 
-from savemanager.api import Engine
+from savemanager.api import Engine, quiescence_verdict
 from savemanager import drive as drive_mod
 from savemanager.drive import DriveClient
 from savemanager.drive_transport import make_requests_http
@@ -18,6 +18,9 @@ _DRIVE_ROOT_FOLDER = "SteamDeckSaveManager"
 
 # Max seconds to wait for Steam's post-exit remotecache.vdf to settle before snapshotting.
 _EXIT_SETTLE_MAX_SECONDS = 8
+
+# Quiescence window for force backup/restore while a game runs: hash -> wait -> hash.
+_QUIESCE_SECONDS = 0.8
 
 _engine = None
 
@@ -70,6 +73,38 @@ class Plugin:
 
     async def get_live_status(self, app_id: int) -> dict:
         return get_engine().live_status(app_id)
+
+    async def get_current_state(self, app_id: int) -> dict:
+        return get_engine().current_state(app_id)
+
+    async def _quiescent(self, app_id) -> str:
+        """'stable' | 'writing' | 'unresolvable'. The sleep is off the engine's
+        synchronous mutation path (same pattern as the debounced auto-backup)."""
+        eng = get_engine()
+        h1 = eng.hash_live_save(app_id)
+        if h1 is None:
+            return "unresolvable"
+        await asyncio.sleep(_QUIESCE_SECONDS)
+        return quiescence_verdict(h1, eng.hash_live_save(app_id))
+
+    async def force_backup(self, game_info: dict) -> dict:
+        """Manual backup while the game runs: snapshot only if the save is quiescent."""
+        q = await self._quiescent(game_info.get("appId"))
+        if q != "stable":
+            return {"status": q}                       # 'writing' | 'unresolvable'
+        entry = get_engine().do_backup(game_info, _now_ms(), _rand_hex())
+        if entry:
+            self._maybe_mirror(game_info)
+        return {"status": "ok" if entry else "nochange", "entry": entry}
+
+    async def force_restore(self, game_info: dict, target_id: str) -> dict:
+        """Restore while the game runs: only if quiescent (restoring mid-write is the
+        worst moment). revert() auto-snapshots the current live save first."""
+        q = await self._quiescent(game_info.get("appId"))
+        if q != "stable":
+            return {"status": q}
+        head = get_engine().revert(game_info, target_id, _now_ms(), _rand_hex())
+        return {"status": "ok", "head": head} if head is not None else {"status": "notfound"}
 
     async def get_diag(self) -> dict:
         eng = get_engine()

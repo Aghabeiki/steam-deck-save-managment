@@ -31,11 +31,13 @@ def set_name(data_root, app_id, version_id, name) -> bool:
 
 
 def remove_version(data_root, app_id, version_id) -> bool:
-    """Delete a non-HEAD version (entry + on-disk dir). Refuses to delete HEAD."""
+    """Delete a non-HEAD, non-pinned version (entry + on-disk dir).
+    Refuses to delete HEAD or a pinned version — the caller must unpin it first."""
     refs = read_refs(data_root, app_id)
     if refs["head"]["versionId"] == version_id:
         return False
-    if _find(refs, version_id) is None:
+    v = _find(refs, version_id)
+    if v is None or v["pinned"]:
         return False
     refs["versions"] = [v for v in refs["versions"] if v["versionId"] != version_id]
     write_refs(data_root, app_id, refs)

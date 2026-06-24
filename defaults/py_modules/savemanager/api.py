@@ -8,6 +8,14 @@ from .mirror import download_version, list_remote_versions, read_index, sync_gam
 from .versioning import cull_versions, do_backup, import_version, is_supported, kept_versions_for, list_versions, load_version_files, resume_pending_revert, revert_to
 
 
+def quiescence_verdict(h1, h2) -> str:
+    """'unresolvable' if either live-hash map is None, else 'stable' if the two
+    maps are equal (save not being written), else 'writing'."""
+    if h1 is None or h2 is None:
+        return "unresolvable"
+    return "stable" if h1 == h2 else "writing"
+
+
 class Engine:
     """Pure, testable facade over the engine. main.py supplies time/randomness."""
 
@@ -61,7 +69,7 @@ class Engine:
 
     def do_backup(self, game_info: dict, now_ms: int, rand_hex: str):
         acct = self._primary()
-        if acct is None:
+        if acct is None or not game_info.get("appId"):
             return None
         keep = get_game_settings(self.data_root, game_info["appId"])["keepCount"]
         return do_backup(self.data_root, self.steam_root, acct, game_info,
@@ -91,9 +99,71 @@ class Engine:
         matches = _live_matches_head(self.data_root, app_id, refs, save_roots, entries)
         return {"hasHead": True, "matchesHead": bool(matches), "resolvable": True}
 
-    def revert(self, game_info: dict, target_id: str, now_ms: int, rand_hex: str):
+    def hash_live_save(self, app_id: int) -> dict | None:
+        """{(suffix, path): sha256} for every live cloud file, or None if the save
+        roots can't be resolved. Content-only — survives mtime/Steam-Cloud bumps."""
+        from .discovery import read_entries, resolve_save_roots
+        from .store import _hash_file, _safe_rel
         acct = self._primary()
         if acct is None:
+            return None
+        installdir = parse_installdir(self.steam_root, app_id)
+        entries = read_entries(self.steam_root, acct, app_id)
+        save_roots = resolve_save_roots(self.steam_root, acct, app_id, entries, installdir)
+        if not save_roots:
+            return None
+        live = {}
+        for absdir, suffix in save_roots.items():
+            for e in entries:
+                if not _safe_rel(e.path):
+                    continue
+                p = os.path.join(absdir, e.path)
+                try:
+                    if os.path.isfile(p):
+                        live[(suffix, e.path)] = _hash_file(p)
+                except OSError:
+                    continue
+        return live
+
+    def current_state(self, app_id: int) -> dict:
+        """Which stored version the LIVE save currently equals, by content hash
+        (mtime-independent), or modified=True if it matches none — 'which save am I on?'."""
+        from .refs import read_refs
+        from .store import read_meta
+        none = {"matchedVersionId": None, "matchedLabel": None, "createdAt": None,
+                "isHead": False, "modified": False, "resolvable": False}
+        acct = self._primary()
+        if acct is None:
+            return none
+        refs = read_refs(self.data_root, app_id)
+        head_id = refs["head"]["versionId"]
+        live = self.hash_live_save(app_id)
+        if live is None:
+            return none
+
+        def version_matches(vid):
+            try:
+                meta = read_meta(self.data_root, app_id, vid)
+            except (OSError, ValueError):
+                return False
+            vset = {(f["suffix"], f["path"]): f.get("sha256") for f in meta["files"]}
+            return all(s is not None for s in vset.values()) and vset == live
+
+        # HEAD first so 'up to date' wins over an identical older snapshot, then newest-first.
+        order = ([head_id] if head_id else []) + \
+            [v["versionId"] for v in refs["versions"] if v["versionId"] != head_id]
+        matched_id = next((vid for vid in order if version_matches(vid)), None)
+        if matched_id is None:
+            return {"matchedVersionId": None, "matchedLabel": None, "createdAt": None,
+                    "isHead": False, "modified": True, "resolvable": True}
+        entry = next((v for v in refs["versions"] if v["versionId"] == matched_id), {})
+        return {"matchedVersionId": matched_id, "matchedLabel": entry.get("name"),
+                "createdAt": entry.get("createdAt"), "isHead": matched_id == head_id,
+                "modified": False, "resolvable": True}
+
+    def revert(self, game_info: dict, target_id: str, now_ms: int, rand_hex: str):
+        acct = self._primary()
+        if acct is None or not game_info.get("appId"):
             return None
         app_id = game_info["appId"]
         head = revert_to(self.data_root, self.steam_root, acct,
@@ -126,7 +196,7 @@ class Engine:
 
     def do_backup_on_exit(self, game_info: dict, now_ms: int, rand_hex: str):
         acct = self._primary()
-        if acct is None:
+        if acct is None or not game_info.get("appId"):
             return None
         app_id = game_info["appId"]
         settings = get_game_settings(self.data_root, app_id)

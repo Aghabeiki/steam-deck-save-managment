@@ -17,6 +17,9 @@ venv/
 .vscode/
 .idea/
 
+# Superpowers tooling state (brainstorm cache) — not project source
+.superpowers/
+
 # Local secrets — never commit OAuth client credentials or tokens
 secrets.json
 *.token.json
